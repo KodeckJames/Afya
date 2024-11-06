@@ -8,8 +8,8 @@ export default function RootLayout() {
         name="index"
         options={{
           title: 'Afya',
-          headerStyle: { backgroundColor: 'black' },
-          headerTintColor: 'purple',
+          headerStyle: { backgroundColor: '#1F2937' },
+          headerTintColor: '#B794F4',
           headerTitleAlign: 'center',
           headerTitleStyle: { fontWeight: 'bold', fontSize: 28 },
           animation: 'slide_from_bottom',
