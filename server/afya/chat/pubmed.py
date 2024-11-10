@@ -1,176 +1,192 @@
-## Extract medical data to be used for the chatbot
-from typing import List, Dict
-from Bio import Entrez
-from langchain_community.vectorstores import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.prompts import PromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI,GoogleGenerativeAIEmbeddings
-from langchain.chains import RetrievalQA
-from tqdm import tqdm
+import os
 import time
+import random
+from Bio import Entrez
+from langchain_google_genai import GoogleGenerativeAIEmbeddings,ChatGoogleGenerativeAI
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain.prompts import PromptTemplate
+from dotenv import load_dotenv
 
-## Create a pubmed RAG Q&A chatbot
+load_dotenv()
+
+
 class PubmedRAG:
-    def __init__(self,email: str,med_api_key: str,google_api_key: str):
-        """
-                Initialize the PubMed RAG system
+    """
+    Class to query PubMed, build a knowledge base using LangChain, and provide retrieval-augmented responses.
+    """
 
-                Args:
-                    email: Email for PubMed API
-                    med_api_key: PubMed API key
-                    google_api_key:GEMINI API key for embeddings and generation
-                """
-
-        self.email = email
+    def __init__(self, email, med_api_key, google_api_key, collection_name="pubmed_knowledge"):
+        # Initialize PubMed API access
         Entrez.email = email
-        self.api_key = med_api_key
-        if med_api_key:
-            Entrez.api_key = med_api_key
+        Entrez.api_key = med_api_key
 
-        ## Initialize embedding and LLM
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
-            api_key = google_api_key
+        # Initialize Google GenAI for embedding and LLM
+        self.google_api_key = google_api_key
+        self.embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004",google_api_key=self.google_api_key)
+        self.llm = ChatGoogleGenerativeAI(model='gemini-1.5-flash',google_api_key=self.google_api_key)
+
+        # Vector store configuration
+        self.collection_name = collection_name
+        self.vectorstore = Chroma(
+            collection_name=self.collection_name,
+            embedding_function=self.embeddings
         )
 
-        self.llm = ChatGoogleGenerativeAI(
-            model='gemini-1.5-flash',
-            verbose=True,
-            google_api_key= google_api_key
-        )
+        # Conversation state
+        self.history = []
 
-        # Initialize text splitter
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            separators=["\n\n", "\n", " ", ""]
-        )
-
-        # Initialize vector store
-        self.vectorstore = None
-
-    def fetch_pubmed_articles(self, query: str, max_results: int = 100) -> List[Dict]:
-        """
-        Fetch articles from PubMed based on search query
-        """
-        # Search for article IDs
-        handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results)
-        record = Entrez.read(handle)
-        handle.close()
-
-        # Fetch article details
-        articles = []
-        for i in tqdm(range(0, len(record["IdList"]), 50)):
-            batch = record["IdList"][i:i + 50]
-            handle = Entrez.efetch(db="pubmed", id=','.join(batch), rettype="medline", retmode="text")
-            articles.extend(self._parse_medline(handle.read()))
+    def fetch_pubmed_articles(self, query, max_results=10, min_abstract_length=100):
+        """Fetch articles from PubMed based on a query."""
+        try:
+            handle = Entrez.esearch(
+                db="pubmed", term=query, retmax=max_results
+            )
+            record = Entrez.read(handle)
             handle.close()
-            time.sleep(0.34)  # Rate limiting
+            pmids = record["IdList"]
 
-        return articles
+            articles = []
+            for pmid in pmids:
+                handle = Entrez.efetch(
+                    db="pubmed", id=pmid, rettype="medline", retmode="text"
+                )
+                medline_text = handle.read()
+                handle.close()
 
-    def _parse_medline(self, medline_text: str) -> List[Dict]:
-        """
-         format text into structured data
-        """
-        articles = []
-        current_article = {}
+                article = self._parse_medline(medline_text)
+                if len(article["abstract"]) >= min_abstract_length:
+                    articles.append(article)
 
-        for line in medline_text.split('\n'):
-            if line.startswith('PMID-'):
-                if current_article:
-                    articles.append(current_article)
-                current_article = {'pmid': line[6:].strip()}
-            elif line.startswith('TI  -'):
-                current_article['title'] = line[6:].strip()
-            elif line.startswith('AB  -'):
-                current_article['abstract'] = line[6:].strip()
-            elif line.startswith('     '):  # Continuation of previous field
-                if 'abstract' in current_article:
-                    current_article['abstract'] += ' ' + line.strip()
-                elif 'title' in current_article:
-                    current_article['title'] += ' ' + line.strip()
+            return articles
+        except Exception as e:
+            print(f"Error fetching PubMed articles: {e}")
+            return []
 
-        if current_article:
-            articles.append(current_article)
+    def _parse_medline(self, medline_text):
+        """Parse MEDLINE formatted text to extract article information."""
+        article = {"title": "", "abstract": "", "authors": [], "mesh_terms": []}
+        lines = medline_text.splitlines()
 
-        return articles
+        for line in lines:
+            if line.startswith("TI  -"):
+                article["title"] = line[5:].strip()
+            elif line.startswith("AB  -"):
+                article["abstract"] += line[5:].strip() + " "
+            elif line.startswith("AU  -"):
+                article["authors"].append(line[5:].strip())
+            elif line.startswith("MH  -"):
+                article["mesh_terms"].append(line[5:].strip())
 
-    def create_knowledge_base(self, articles: List[Dict]):
-        """
-        Create vector store from fetched articles
-        """
-        # Prepare documents for vectorization
-        documents = []
-        for article in articles:
-            if 'abstract' in article:
-                text = f"Title: {article.get('title', '')}\nAbstract: {article['abstract']}\nPMID: {article['pmid']}"
-                chunks = self.text_splitter.split_text(text)
-                documents.extend(chunks)
+        article["abstract"] = article["abstract"].strip()
+        return article
 
-        # Create vector store
-        self.vectorstore = Chroma.from_texts(
-            texts=documents,
-            embedding=self.embeddings,
-            persist_directory="./pubmed_chroma_db"
-        )
+    def create_knowledge_base(self, articles, batch_size=5):
+        """Build and store embeddings for PubMed articles in batches."""
+        try:
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000, chunk_overlap=100
+            )
 
-    def query_knowledge_base(self, query: str, k: int = 4) -> str:
-        """
-        Query the knowledge base using RAG
-        """
-        if not self.vectorstore:
-            raise ValueError("Knowledge base not initialized. Call create_knowledge_base first.")
+            for i in range(0, len(articles), batch_size):
+                batch = articles[i:i + batch_size]
+                docs = []
 
-        # Create RAG chain
-        prompt_template = """
-            You are a friendly medical AI doctor assistant helping to answer questions from patients with various illnesses based on scientific literature.
-            Use the following pieces of context from medical research papers to answer the question.
-            If you cannot answer the question based on the context, say so.
-            Always include PMID references for your sources.
+                for article in batch:
+                    content = f"{article['title']}\n{article['abstract']}"
+                    splits = text_splitter.split_text(content)
+                    for split in splits:
+                        docs.append({"content": split, "metadata": article})
 
-            Context: {context}
+                # Add documents to vector store
+                retries = 3
+                for attempt in range(retries):
+                    try:
+                        self.vectorstore.add_texts([doc["content"] for doc in docs],
+                                                   metadata=[doc["metadata"] for doc in docs])
+                        break
+                    except Exception as e:
+                        if attempt < retries - 1:
+                            print(f"Error adding to vector store, retrying ({attempt + 1}/{retries}): {e}")
+                            time.sleep(random.uniform(1, 3))
+                        else:
+                            print(f"Failed to add texts after {retries} attempts: {e}")
 
-            Question: {question}
+        except Exception as e:
+            print(f"Error creating knowledge base: {e}")
 
-            Answer: """
+    def query_knowledge_base(self, query, k=3):
+        """Query the vector store and generate a response using LLM."""
+        try:
+            # Perform vector store similarity search
+            results = self.vectorstore.similarity_search(query, k=k)
+            context = "\n\n".join([res["content"] for res in results])
 
-        PROMPT = PromptTemplate(
-            template=prompt_template,
-            input_variables=["context", "question"]
-        )
+            prompt_template = PromptTemplate(
+                template="""
+                You are an AI assistant using PubMed data to answer questions. Here is some context to assist:
 
-        chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
-            retriever=self.vectorstore.as_retriever(search_kwargs={"k": k}),
-            chain_type_kwargs={"prompt": PROMPT}
-        )
+                {context}
 
-        return chain.invoke(query)
+                Question: {query}
 
-    def main():
-        # Example usage
-        email = "your_email@example.com"
-        med_api_key = "your_pubmed_api_key"  # Optional
-        google_api_key = "your_gemini_api_key"
+                Provide a detailed, accurate response based on the context above.
+                """
+            )
+            prompt = prompt_template.format(context=context, query=query)
+            response = self.llm(prompt)
 
-        # Initialize system
-        rag_system = PubmedRAG(email, med_api_key, google_api_key)
+            # Record exchange history
+            self.history.append({"query": query, "response": response})
 
-        # Fetch articles
-        articles = rag_system.fetch_pubmed_articles(
-            query="cancer immunotherapy treatment outcomes",
-            max_results=100
-        )
+            return response
+        except Exception as e:
+            print(f"Error querying knowledge base: {e}")
+            return "An error occurred while processing your request."
 
-        # Create knowledge base
-        rag_system.create_knowledge_base(articles)
+    def get_conversation_context(self, max_exchanges=5):
+        """Return the most recent exchanges for context."""
+        return self.history[-max_exchanges:]
 
-        # Query the system
-        query = "What are the latest developments in CAR-T cell therapy for solid tumors?"
-        response = rag_system.query_knowledge_base(query)
-        print(response)
+    def clear_history(self):
+        """Clear conversation history."""
+        self.history = []
 
-    if __name__ == "__main__":
-        main()
+    def save_session(self, filename):
+        """Save conversation history to a file."""
+        try:
+            with open(filename, "w") as file:
+                for entry in self.history:
+                    file.write(f"Query: {entry['query']}\nResponse: {entry['response']}\n\n")
+        except Exception as e:
+            print(f"Error saving session: {e}")
+
+    def get_session_summary(self):
+        """Return a summary of the session metrics."""
+        total_exchanges = len(self.history)
+        success_rate = sum(1 for h in self.history if h[
+            'response'] != "An error occurred while processing your request.") / total_exchanges if total_exchanges > 0 else 0
+
+        return {
+            "total_exchanges": total_exchanges,
+            "success_rate": success_rate,
+            "session_duration": f"{time.time() - self.start_time:.2f} seconds"
+        }
+
+
+def main():
+    ## Initialize the PubmedRAG class
+    email = "otienookoth007@gmail.com",
+    med_api_key = os.getenv("MED_API_KEY"),
+    google_api_key = os.getenv("GOOGLE_API_KEY")
+
+    pubmed_rag = PubmedRAG(email,med_api_key,google_api_key)
+
+    articles = pubmed_rag.fetch_pubmed_articles("COVID-19", max_results=5)
+    pubmed_rag.create_knowledge_base(articles)
+
+    response = pubmed_rag.query_knowledge_base("What are the recent advancements in COVID-19 vaccines?")
+    print(response)
+
+if __name__ == "__main__":
+    main()
