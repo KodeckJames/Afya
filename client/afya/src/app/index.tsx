@@ -16,11 +16,9 @@ interface Message {
 }
 
 const ChatScreen: React.FC = () => {
-  // State for messages and input text
+  // State for messages, input text, and welcome/help messages
   const [messages, setMessages] = useState<Message[]>([])
   const [inputText, setInputText] = useState<string>('')
-
-  // States for the welcome messages
   const [welcomeMessage, setWelcomeMessage] = useState<string>('')
   const [helpMessage, setHelpMessage] = useState<string>('')
 
@@ -59,20 +57,36 @@ const ChatScreen: React.FC = () => {
     return () => clearTimeout(messageTimeout)
   }, [])
 
-  // Stop typing effect once the user starts typing
-  const handleUserInput = () => {
+  // Function to handle sending user input to backend and receiving AI response
+  const sendMessageToBackend = async (userMessage: string) => {
+    try {
+      const response = await fetch(
+        'http://<your-django-server-url>/api/chat/',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: userMessage }),
+        }
+      )
+      const data = await response.json()
+      return data.response // Retrieve the AI response from the backend
+    } catch (error) {
+      console.error('Error connecting to backend:', error)
+      return 'Error: Unable to connect to server.'
+    }
+  }
+
+  const handleUserInput = async () => {
     setMessages((prevMessages) => [
       ...prevMessages,
       { text: inputText, isUser: true },
     ])
+    const aiResponse = await sendMessageToBackend(inputText) // Fetch AI response
+    setMessages((prevMessages) => [
+      ...prevMessages,
+      { text: aiResponse, isUser: false },
+    ])
     setInputText('') // Clear input
-    // Add the AI response after a short delay
-    setTimeout(() => {
-      setMessages((prevMessages) => [
-        ...prevMessages,
-        { text: 'AI Response', isUser: false },
-      ])
-    }, 1000)
   }
 
   return (
